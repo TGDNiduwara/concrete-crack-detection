@@ -6,6 +6,8 @@ from torch.utils.data import DataLoader, random_split
 import time
 import os
 from tqdm import tqdm
+import mlflow # <--- NEW IMPORT
+import mlflow.pytorch
 
 # 1. SETUP
 BATCH_SIZE = 256
@@ -42,84 +44,82 @@ val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 print(f"Training on {train_size} images, Validating on {val_size} images.")
 
-# 3. SETUP MODEL (Transfer Learning)
-# Download pre-trained ResNet18
+# 2. SETUP MODEL
 model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-
-# Freeze all layers (so we don't mess up the pre-trained 'brain')
 for param in model.parameters():
     param.requires_grad = False
-
-# Replace the final layer (The 'Head')
-# ResNet18's original fully connected layer (fc) has 512 inputs and 1000 outputs (ImageNet classes).
-# We change it to output 2 classes: [Negative, Positive]
 num_ftrs = model.fc.in_features
 model.fc = nn.Linear(num_ftrs, 2)
-
 model = model.to(DEVICE)
 
-# 4. LOSS AND OPTIMIZER
 criterion = nn.CrossEntropyLoss()
-# Only optimize the parameters of the final layer (model.fc)
 optimizer = optim.Adam(model.fc.parameters(), lr=LEARNING_RATE)
 
-# 5. TRAINING LOOP
-print("\nStarting Training...")
-start_time = time.time() 
-    # Training Phase
-for epoch in range(EPOCHS):
-    model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
+# --- START MLFLOW EXPERIMENT ---
+mlflow.set_experiment("Concrete Crack Detection")
+
+with mlflow.start_run(): # <--- EVERYTHING RUNS INSIDE THIS BLOCK
     
-    # WRAP THE LOADER WITH TQDM
-    # This creates the progress bar object
-    loop = tqdm(train_loader, leave=True)
-    loop.set_description(f"Epoch [{epoch+1}/{EPOCHS}]")
-    
-    for images, labels in loop:   # <--- USE 'loop' INSTEAD OF 'train_loader'
-        images, labels = images.to(DEVICE), labels.to(DEVICE)
+    # Log your Hyperparameters (So you remember what settings you used)
+    mlflow.log_param("epochs", EPOCHS)
+    mlflow.log_param("batch_size", BATCH_SIZE)
+    mlflow.log_param("learning_rate", LEARNING_RATE)
+    mlflow.log_param("model", "ResNet18")
+
+    print("\nStarting Training...")
+    start_time = time.time()
+
+    for epoch in range(EPOCHS):
+        model.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
         
-        optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
+        loop = tqdm(train_loader, leave=True)
+        loop.set_description(f"Epoch [{epoch+1}/{EPOCHS}]")
         
-        running_loss += loss.item()
-        _, predicted = torch.max(outputs.data, 1)
-        total += labels.size(0)
-        correct += (predicted == labels).sum().item()
-        
-        # UPDATE THE BAR
-        # This updates the text next to the bar in real-time
-        loop.set_postfix(loss=loss.item(), acc=100*correct/total)
-    train_acc = 100 * correct / total
-    # ... (keep validation code the same) ...
-    
-    # Validation Phase (Check accuracy on unseen data)
-    model.eval() # Set model to evaluation mode
-    val_correct = 0
-    val_total = 0
-    with torch.no_grad():
-        for images, labels in val_loader:
+        for images, labels in loop:
             images, labels = images.to(DEVICE), labels.to(DEVICE)
-            outputs = model(images)
-            _, predicted = torch.max(outputs.data, 1)
-            val_total += labels.size(0)
-            val_correct += (predicted == labels).sum().item()
             
-    val_acc = 100 * val_correct / val_total
-    
-    print(f"Epoch [{epoch+1}/{EPOCHS}] "
-          f"Loss: {running_loss/len(train_loader):.4f} | "
-          f"Train Acc: {train_acc:.2f}% | "
-          f"Val Acc: {val_acc:.2f}%")
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+            
+            loop.set_postfix(loss=loss.item(), acc=100*correct/total)
+        
+        # Calculate Epoch Metrics
+        epoch_loss = running_loss/len(train_loader)
+        train_acc = 100 * correct / total
+        
+        # Validation Phase
+        model.eval()
+        val_correct = 0
+        val_total = 0
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(DEVICE), labels.to(DEVICE)
+                outputs = model(images)
+                _, predicted = torch.max(outputs.data, 1)
+                val_total += labels.size(0)
+                val_correct += (predicted == labels).sum().item()
+                
+        val_acc = 100 * val_correct / val_total
+        
+        print(f"Epoch [{epoch+1}/{EPOCHS}] Loss: {epoch_loss:.4f} | Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}%")
+        
+        # --- LOG METRICS TO MLFLOW ---
+        mlflow.log_metric("loss", epoch_loss, step=epoch)
+        mlflow.log_metric("train_acc", train_acc, step=epoch)
+        mlflow.log_metric("val_acc", val_acc, step=epoch)
 
-total_time = time.time() - start_time
-print(f"\nTraining Finished in {total_time/60:.2f} minutes.")
-
-# 6. SAVE MODEL
-torch.save(model.state_dict(), 'crack_detection_model.pth')
-print("Model saved to crack_detection_model.pth")
+    # Save the model to MLflow (and locally)
+    mlflow.pytorch.log_model(model, "model")
+    torch.save(model.state_dict(), 'crack_detection_model.pth')
+    print("Training Finished and logged to MLflow!")

@@ -2,3 +2,4 @@
 torchvision
 matplotlib
 tqdm
+mlflow
